@@ -1,0 +1,484 @@
+---
+title: "Restaurant inspection prediction"
+author: "Yu-Kai Huang"
+date: "November 1, 2020"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 4
+  pdf_document:
+    toc: yes
+    toc_depth: '4'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+This post analyzes restaurant inspection grades using the data from [the City of Las Vegas Open Data Portal](https://opendataportal-lasvegas.opendata.arcgis.com/datasets/restaurant-inspections-open-data). The content of this post includes an exploratory analysis of the data set, an application of the Random Forests technique to predict restaurant inspection grades, and associated recommendations. 
+
+Load the required packages
+```{r load packages, echo=TRUE, message=FALSE, warning = FALSE, include=TRUE}
+library("readr")  # provides a fast and friendly way to read rectangular data 
+library("dplyr")  # widely used package for working with data frames
+library("tidyr")  # widely used package for working with data frames
+library("knitr")  # creates well-formatted tables
+library("stringr")  # use str_sub() for character manipulation
+library("datetime") # as.Date()
+library("reshape2") # convert a wide table to a long table
+library("ggplot2")  # a powerful visualization package
+library("scales") # provide extension function for modifying labels in ggplot
+library("mapdata")  # map_data()
+library("mapproj")  # coord_map()
+library("ranger") # a c++ implementation of random forest 
+library("h2o")  # a java-based implementation of random forest
+library("vip")  # create variable importance plots
+```
+
+Load a training data set and testing data set from Github. 
+```{r Input data, message=FALSE, warning = FALSE}
+# Read csv files stored in the designated Github repository
+DF_TRAIN_raw <- data.frame(read_csv(url("https://raw.githubusercontent.com/ykaih/Restaurant-inspection/main/TRAIN_SET.csv")))
+DF_TEST_raw <- data.frame(read_csv(url("https://raw.githubusercontent.com/ykaih/Restaurant-inspection/main/TEST_SET.csv")))
+```
+&nbsp;  
+
+### I. Exploratory data anaysis
+To overview the structure of the data set, we can first use "str()" to summarize data frame information, such as dimension, variable (column) names, types of an object for each variable, and overviews of the first few observations.
+```{r structure}
+str(DF_TRAIN_raw)
+```
+The data structure shows that some variables can be further processed, such as "LAT_LONG_RAW" and "INSPECTION_TIME." The following codes separate latitude and longitude information from a single one column (LAT_LONG_RAW). Some observations, which have coordinates outside of Nevada, are excluded. 
+```{r location}
+# Seperate LAT_LONG_RAW into 'LATITUDE' and 'LONGITUDE' columns
+DF_loc <- DF_TRAIN_raw %>% 
+  select(LAT_LONG_RAW, ZIP) %>%
+  separate(LAT_LONG_RAW,into = c('LATITUDE', 'LONGITUDE'), sep=",")
+
+# Remove "(" and ")"
+DF_loc$LATITUDE <- gsub("[\\(\\)]", "", DF_loc$LATITUDE)
+DF_loc$LONGITUDE <- gsub("[\\(\\)]", "", DF_loc$LONGITUDE)
+
+# Extract 5-digit zipcodes
+DF_loc$ZIP5 <- substr(DF_loc$ZIP, 1, 5)
+DF_loc <- select(DF_loc, -c(ZIP))
+
+# Combine with the original data
+DF_TRAIN_raw1 <- cbind.data.frame(DF_TRAIN_raw, DF_loc)
+
+# Adjust coordinate formats
+DF_TRAIN_raw1$LATITUDE <- as.numeric(DF_TRAIN_raw1$LATITUDE)
+DF_TRAIN_raw1$LONGITUDE <- abs(as.numeric(DF_TRAIN_raw1$LONGITUDE))*(-1)
+
+# Remove observation incorrect coordinates
+DF_TRAIN_raw1 <- DF_TRAIN_raw1 %>% filter(LATITUDE != 0)
+  
+# Examine the dimension
+dim(DF_TRAIN_raw1)
+```
+Next, the "INSPECTION_TIME" column includes a specific inspection date and time. To better analyze that information, we can separate that information from single one column into Date, Year, Month, and Hour columns.
+```{r Time object}
+# seperate "INSPECTION_TIME" column into Hour and Date
+Hour <- format(as.POSIXct(strptime(DF_TRAIN_raw1$INSPECTION_TIME,"%m/%d/%Y %H:%M",tz="")) ,format = "%H:%M")
+Date <- format(as.POSIXct(strptime(DF_TRAIN_raw1$INSPECTION_TIME,"%m/%d/%Y %H:%M",tz="")) ,format = "%m/%d/%Y")
+
+Hour <- str_sub(Hour, 1, 2)
+Date <- as.Date(Date, format = "%m/%d/%Y")
+Year <- str_sub(Date, 1, 4)
+Month <- str_sub(Date, 6, 7)
+
+# Combine with the original data
+DF_TRAIN_raw2 <- cbind.data.frame(DF_TRAIN_raw1, Date, Year, Month, Hour)
+
+# Examine the dimension
+dim(DF_TRAIN_raw2)
+```
+Since the variable of interest, NEXT_INSPECTION_GRADE_C_OR_BELOW", is a binary variable, the following summary statistics include bivariate tests of significance. For continuous variables, the bivariate test is a t-test or ANOVA (depending on the number of levels of the group), and means and standard deviations are shown. For categorical variables, the chi-square test of independence is performed, and counts and percentages for the reference category are presented. 
+
+```{r summarize key variable, message=FALSE, warning = FALSE}
+Summary_stat <- furniture::table1(DF_TRAIN_raw1,
+  "Next inespection grade" = NEXT_INSPECTION_GRADE_C_OR_BELOW, 
+  "Current grade" = CURRENT_GRADE, 
+  "Restaurant category" = RESTAURANT_CATEGORY,
+  "City" = CITY, 
+  "Current demerits" = CURRENT_DEMERITS,
+  "Inspection demerits" = INSPECTION_DEMERITS,
+  "Inspection type" = INSPECTION_TYPE,
+  "Median employee age" = MEDIAN_EMPLOYEE_AGE,
+  "Median employee tenure" = MEDIAN_EMPLOYEE_TENURE,
+  "Num. of violations" = NUMBER_OF_VIOLATIONS,
+  "First violations" = FIRST_VIOLATION_TYPE,
+  "Second violations" = SECOND_VIOLATION_TYPE,
+  "Third violations" = THIRD_VIOLATION_TYPE,
+  splitby = NEXT_INSPECTION_GRADE_C_OR_BELOW ~ CURRENT_GRADE + RESTAURANT_CATEGORY + CITY + CURRENT_DEMERITS + INSPECTION_DEMERITS +
+    INSPECTION_TYPE + MEDIAN_EMPLOYEE_AGE + MEDIAN_EMPLOYEE_TENURE + NUMBER_OF_VIOLATIONS + 
+    FIRST_VIOLATION_TYPE + SECOND_VIOLATION_TYPE + THIRD_VIOLATION_TYPE,
+  test = TRUE,
+  na.rm = FALSE,
+  format_number = TRUE
+)
+
+kable(Summary_stat)
+```
+
+The above summary statistics indicate that there are several observations with NAs, which may affect modeling results. Thus, the following code excludes 3,572 observations with NAs (or 22.82% of the total observations).
+```{r rm na obs}
+# Remove na observations
+DF_TRAIN <- DF_TRAIN_raw2[complete.cases(DF_TRAIN_raw2),]
+
+# Examine a change in the number of observation in the resulting dataframe
+sprintf("Remove %d observations from the original data", nrow(DF_TRAIN) - nrow(DF_TRAIN_raw2))
+
+sprintf("Remove %.2f percent of the original data", round((nrow(DF_TRAIN_raw2)-nrow(DF_TRAIN))/nrow(DF_TRAIN_raw2)*100,2))
+```
+
+After cleaning data, we first explore the relationship between inspection violations and possible indicators of inspection grades, "CURRENT_DEMERITS" and "INSPECTION_DEMERITS." The following scatterplots show that the number of inspection violations seems positively correlated with the number of inspection demerits, but not quite evident with the number of current demerits.
+```{r demerits and number of violation, message=FALSE, warning = FALSE, fig.align = 'center'}
+# Visualize: Number of violation
+theme_set(theme_bw())
+DF_TRAIN %>% select(NEXT_INSPECTION_GRADE_C_OR_BELOW,NUMBER_OF_VIOLATIONS,CURRENT_DEMERITS,INSPECTION_DEMERITS) %>%
+  melt(id.vars = c("NEXT_INSPECTION_GRADE_C_OR_BELOW","NUMBER_OF_VIOLATIONS"),
+       variable.name = "Period", value.name = "Demerits") %>% 
+  mutate(Severity = factor(Period, level = c("CURRENT_DEMERITS","INSPECTION_DEMERITS"))) %>%
+  
+  ggplot(aes(x=Demerits, y=NUMBER_OF_VIOLATIONS, color = factor(NEXT_INSPECTION_GRADE_C_OR_BELOW))) +
+  geom_point() + 
+  scale_color_discrete(name = "Next inspection grade", labels = c("Above grade C", "Below grade C")) +
+  scale_y_continuous(labels = comma) +
+  labs(y="Number of violation", x = "Number of demerits", title = "Next inspection grade, by quantity of violations and demerits") + 
+  facet_wrap( ~ Period) +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "top", 
+        legend.title = element_text(face = "bold"), text = element_text(size=12))
+```
+In addition to the quantity of violations, the following charts show the relationship between the severity of violations and inspection grades. The proportion of below grade C in the critical violation category is higher for the first violation and becomes lower for the third violation. On the other hand, the shares of below grade C in the non-major violation category are lower for the first violation and higher for the third violation. However, overall, differences across different severities are not very evident. 
+```{r barchart: violation type II, message=FALSE, warning = FALSE, fig.align = 'center'}
+# Visualize: Number of violation
+DF_TRAIN %>% select(NEXT_INSPECTION_GRADE_C_OR_BELOW,NUMBER_OF_VIOLATIONS, 
+                    FIRST_VIOLATION_TYPE,SECOND_VIOLATION_TYPE,THIRD_VIOLATION_TYPE) %>%
+  melt(id.vars = c("NEXT_INSPECTION_GRADE_C_OR_BELOW","NUMBER_OF_VIOLATIONS"),
+       variable.name = "Violation", value.name = "Severity") %>% 
+  mutate(Severity = factor(Severity, level = c("Non-Major","Major","Critical","Imminent Health Hazard"))) %>%
+  
+  ggplot(aes(x=Severity, fill = factor(NEXT_INSPECTION_GRADE_C_OR_BELOW))) +
+  geom_bar(stat="count", position = "dodge2") + 
+  scale_fill_discrete(name = "Next inspection grade", labels = c("Above grade C", "Below grade C")) +
+  scale_y_continuous(labels = comma) +
+  labs(y="count", x = "Severity", title = "Next inspection grade, by severity of violations") + 
+  facet_wrap( ~ Violation, 
+             labeller = labeller(Violation = c(FIRST_VIOLATION_TYPE="1st violation",
+                                                        SECOND_VIOLATION_TYPE="2nd violation",
+                                                        THIRD_VIOLATION_TYPE="3rd violation"))) +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "top", 
+        legend.title = element_text(face = "bold"), text = element_text(size=12), axis.text.x=element_text(angle = 20, vjust=1, hjust=1))
+```
+Next, we explore the relationship between inspection grades and restaurant types. The bar chart shows that most observations are classified as Restaurant, Bar/Tavern, Snack Bar, and Special Kitchen.
+```{r barchart: restaurant type, message=FALSE, warning = FALSE, out.height="150%", fig.align = 'center'}
+# Convert "NEXT_INSPECTION_GRADE_C_OR_BELOW" as a factor object
+DF_TRAIN$NEXT_INSPECTION_GRADE_C_OR_BELOW <- factor(DF_TRAIN$NEXT_INSPECTION_GRADE_C_OR_BELOW, level = c("0","1"))
+
+# Visualization: which day of week has more items per order?
+ggplot(data = DF_TRAIN, aes(x=RESTAURANT_CATEGORY, fill = factor(NEXT_INSPECTION_GRADE_C_OR_BELOW))) +
+  geom_bar(stat="count", position = "dodge2") + 
+  scale_fill_discrete(name = "Next inspection grade", labels = c("Above grade C", "Below grade C")) +
+  scale_y_continuous(labels = comma) +
+  labs(y="count", x = "Restaurant category", title = "Next inspection grade, by restaurant type") + 
+  theme(plot.title = element_text(hjust = 0.5), legend.position = c(0.2,0.7), legend.background = element_rect(fill = "gray95"),
+        legend.title = element_text(face = "bold"), text = element_text(size=12), axis.text.x=element_text(angle = 90, vjust=0.5, hjust=1))
+```
+We next explore whether inspection timings have seasonal variations across the above main restaurant categories. The chart shows that overall inspections occur less frequently during the holiday season (November and December) across the four main restaurant categories.
+```{r monthly, message=FALSE, warning = FALSE, fig.align = 'center'}
+# Visualize: monthly and restaurant type
+DF_TRAIN %>% 
+  filter(RESTAURANT_CATEGORY %in% c("Restaurant","Bar / Tavern","Snack Bar","Special Kitchen")) %>%
+  
+  ggplot(aes(x=Month, fill = factor(NEXT_INSPECTION_GRADE_C_OR_BELOW))) +
+  geom_bar(stat="count", position = "dodge2") + 
+  scale_fill_discrete(name = "Next inspection grade", labels = c("Above grade C", "Below grade C")) +
+  scale_y_continuous(labels = comma) +
+  labs(y="count", x = "Month", title = "Next inspection grade, by seasonality and restaurant type") + 
+  facet_wrap(~RESTAURANT_CATEGORY, nrow=2) +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "top", 
+        legend.title = element_text(face = "bold"), text = element_text(size=12))
+```
+Besides that, the following bar chart examines inspection years from our observations, showing our samples are mainly from 2010, 2011, and 2012.
+```{r yearly, message=FALSE, warning = FALSE, fig.align = 'center'}
+# Visualize: yearly and restaurant type
+ggplot(DF_TRAIN, aes(x=Year, fill = factor(NEXT_INSPECTION_GRADE_C_OR_BELOW))) +
+  geom_bar(stat="count", position = "dodge2") + 
+  scale_fill_discrete(name = "Next inspection grade", labels = c("Above grade C", "Below grade C")) +
+  scale_y_continuous(labels = comma) +
+  labs(y="count", x = "Year", title = "Next inspection grade, by updated record years") + 
+  #facet_wrap(~Year, nrow=1) +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "top", 
+        legend.title = element_text(face = "bold"), text = element_text(size=12))
+```
+In addition to exploring temporal variations of our data, the following charts examine spatial variations. For the city-level exploration, most inspections appear in Las Vegas, and very few of them occur in North Las Vegas and Henderson. 
+```{r barchart: city, message=FALSE, warning = FALSE, fig.align = 'center'}
+# Barchart
+DF_TRAIN %>% 
+  filter(RESTAURANT_CATEGORY %in% c("Restaurant","Bar / Tavern","Snack Bar","Special Kitchen")) %>%
+  
+  ggplot(aes(x=CITY, fill = factor(NEXT_INSPECTION_GRADE_C_OR_BELOW))) +
+  geom_bar(stat="count", position = "dodge2") + 
+  scale_fill_discrete(name = "Next inspection grade", labels = c("Above grade C", "Below grade C")) +
+  scale_y_continuous(labels = comma) +
+  labs(y="count", x = "City", title = "Next inspection grade, by city") + 
+  facet_wrap(~RESTAURANT_CATEGORY, nrow=2) +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "top",
+        legend.title = element_text(face = "bold"), text = element_text(size=12), axis.text.x=element_text(angle = 90, vjust=0.5, hjust=1))
+```
+At the 5-digit-zipcode-level, there are a large number of observations from 89109, 89119, and 89101-89104, where Las Vegas locates.
+```{r barchart: zipcode, message=FALSE, warning = FALSE, fig.align = 'center'}
+# Barchart
+DF_TRAIN %>% 
+  group_by(ZIP5) %>% 
+  select(NEXT_INSPECTION_GRADE_C_OR_BELOW) %>%
+  
+  ggplot(aes(x=ZIP5, fill = factor(NEXT_INSPECTION_GRADE_C_OR_BELOW))) +
+  geom_bar(position = "dodge2") + 
+  scale_fill_discrete(name = "Next inspection grade", labels = c("Above grade C", "Below grade C")) +
+  scale_y_continuous(labels = comma) +
+  labs(y="count", x = "Zipcode", title = "Next inspection grade, by Zipcode") + 
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "top",
+        legend.title = element_text(face = "bold"), text = element_text(size=10), axis.text.x=element_text(angle = 90, vjust=0.5, hjust=1))
+
+```
+Since the number of inspection demerits is one of the strong indicators for low inspection grades, the following map shows the number of inspection demerits in respective geographical locations. It indicates that most restaurants with high inspection demerits are in Las Vegas. Only very few observations having high demerits locate near the state border between Nevada and Utah and Phoenix. 
+```{r map: location, message=FALSE, warning = FALSE, fig.align = 'center'}
+# Select a map base
+Nevada <- map_data("state") %>% filter(region =="nevada")
+
+# Draw a map
+ggplot(DF_TRAIN, aes(x = LONGITUDE, y = LATITUDE)) + 
+  geom_polygon(data = Nevada, aes(x = long, y = lat), fill = "gray90", color = "black") +
+  geom_point(aes(color = INSPECTION_DEMERITS), size=0.9, alpha=0.1) +
+  coord_map(xlim = c(-116,-114), ylim = c(35,37)) +
+  labs(title = "Inspection demerits, by locations") +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "top",
+        legend.title = element_text(face = "bold"), text = element_text(size=12))
+```
+
+### II. Modeling process
+Identifying inspection grades is a classification problem (i.e., whether the restaurant’s next inspection is below Grade C), and the data set has several categorical features. Hence, this post applies the random forests technique to build a minimally viable model. According to the above exploratory analysis, the data appears spatial-temporal variations. The number of violations, demerits, and restaurant categories also seem to be possible determinants. Thus, we first include predictors, such as locations, time, and continuous variables, which may explain more variations of the variable of interest. The resulting root-mean-square error  (RMSE) is about 0.3871.
+```{r first forests, message=FALSE, warning = FALSE}
+# De-select irrelevant columns based on the above exploratory analysis
+DF_TRAIN_rf <- DF_TRAIN %>% select(-c("RESTAURANT_SERIAL_NUMBER","RESTAURANT_PERMIT_NUMBER","RESTAURANT_NAME","RESTAURANT_LOCATION","ADDRESS","STATE","INSPECTION_TYPE","INSPECTION_TIME","VIOLATIONS_RAW","LAT_LONG_RAW","FIRST_VIOLATION","SECOND_VIOLATION","THIRD_VIOLATION","RECORD_UPDATED","Date","LATITUDE","LONGITUDE","ZIP5","FIRST_VIOLATION_TYPE","SECOND_VIOLATION_TYPE","THIRD_VIOLATION_TYPE","CURRENT_GRADE"))
+
+# number of features
+n_features <- length(setdiff(names(DF_TRAIN_rf), "NEXT_INSPECTION_GRADE_C_OR_BELOW"))
+
+# train a default random forest model
+rf1 <- ranger(
+  NEXT_INSPECTION_GRADE_C_OR_BELOW ~ ., 
+  data = DF_TRAIN_rf,
+  mtry = floor(n_features / 3),
+  respect.unordered.factors = "order",
+  seed = 123
+)
+
+# get OOB RMSE
+(default_rmse <- sqrt(rf1$prediction.error))
+```
+
+Random forests models require to fine tune several hyperparameters, including (1) the number of trees in the forest, (2) the number of features to consider at any given split (mtry), (3) the complexity of each tree, (4) the sampling approach, and (5) the splitting rule to use during tree construction.  
+
+```{r Create a hyperparameter grid: ranger, message=FALSE, warning = FALSE}
+# Create hyperparameter grid
+hyper_grid_ranger <- expand.grid(
+  
+  # The number of features to consider at any given split
+  mtry = floor(n_features * c(.1, .25, .5, .75, .9)),
+  
+  # Adjusting node size based on impact to accuracy and run time.
+  min.node.size = c(1, 3, 5, 10), 
+  
+  # Sampling methods
+  replace = c(TRUE, FALSE),
+  
+  # Sampling fraction
+  sample.fraction = c(.5, .63, .8),
+  
+  # Create empty RMSE for storing searching results
+  rmse = NA                                               
+)
+```
+The above code creates a grid of hyperparameter values for a grid search. The below grid search assesses possible candidate models in terms of the resulting out-of-bag (OOB) error. 
+```{r tune hyperparameters: ranger, message=FALSE, warning=FALSE}
+# Warning: This grid search takes approximately a few minutes.
+# Execute full cartesian grid search
+for(i in seq_len(nrow(hyper_grid_ranger))) {
+  
+  # fit model for ith hyperparameter combination
+  fit <- ranger(
+    formula         = NEXT_INSPECTION_GRADE_C_OR_BELOW ~ ., 
+    data            = DF_TRAIN_rf, 
+    num.trees       = n_features * 10,
+    mtry            = hyper_grid_ranger$mtry[i],
+    min.node.size   = hyper_grid_ranger$min.node.size[i],
+    replace         = hyper_grid_ranger$replace[i],
+    sample.fraction = hyper_grid_ranger$sample.fraction[i],
+    verbose         = FALSE,
+    seed            = 123,
+    respect.unordered.factors = "order"
+  )
+  
+  # export OOB error 
+  hyper_grid_ranger$rmse[i] <- sqrt(fit$prediction.error)
+}
+
+# assess top 10 models
+tuned_para <- hyper_grid_ranger %>%
+  arrange(rmse) %>%
+  mutate(perc_gain = (default_rmse - rmse) / default_rmse * 100) %>%
+  head(10)
+
+# Show the top 10 models
+tuned_para
+
+```
+To get a better picture of our error rate, we repeatedly fit the random forest models using the above top first tuned hyperparameters. The below histogram shows our expected error ranges between 0.383 and 0.390.
+```{r fit a model with tuned hyperparameters: ranger, message=FALSE, warning=FALSE, include=TRUE}
+# Warning: This estimation of rmse distribution takes approximately a few minutes.
+# Fit a model with tuned hyperparameters 
+OOB_RMSE <- vector(mode = "numeric", length = 100)
+
+for(i in seq_along(OOB_RMSE)) {
+  
+  # Fit random forests models using the preferred hyperparameters without setting seed sequences
+  optimal_ranger <- ranger(
+    formula         = NEXT_INSPECTION_GRADE_C_OR_BELOW ~ ., 
+    data            = DF_TRAIN_rf, 
+    num.trees       = n_features * 10,
+    mtry            = tuned_para[tuned_para$perc_gain==max(tuned_para$perc_gain),"mtry"],
+    min.node.size   = tuned_para[tuned_para$perc_gain==max(tuned_para$perc_gain),"min.node.size"],
+    replace         = tuned_para[tuned_para$perc_gain==max(tuned_para$perc_gain),"replace"],
+    sample.fraction = tuned_para[tuned_para$perc_gain==max(tuned_para$perc_gain),"sample.fraction"],
+    respect.unordered.factors = "order",
+    importance      = 'impurity'
+  )
+  
+  OOB_RMSE[i] <- sqrt(optimal_ranger$prediction.error)
+}
+
+# Show a histogram of OOB RMSE
+hist(OOB_RMSE, breaks = 20)
+```
+
+The following chart shows the variable of importance in terms of reductions of impurities by including each feature variable at each node. It suggests that ZIP code, some employee characters, and the number of inspection demerits are key determinants of inspection grades.
+```{r compare tuned hyperparameters, message=FALSE, warning = FALSE}
+# Re-run model with impurity-based variable importance
+rf_impurity <- ranger(
+    formula         = NEXT_INSPECTION_GRADE_C_OR_BELOW ~ ., 
+    data            = DF_TRAIN_rf, 
+    num.trees       = n_features * 10,
+    mtry            = tuned_para[tuned_para$perc_gain==max(tuned_para$perc_gain),"mtry"],
+    min.node.size   = tuned_para[tuned_para$perc_gain==max(tuned_para$perc_gain),"min.node.size"],
+    replace         = tuned_para[tuned_para$perc_gain==max(tuned_para$perc_gain),"replace"],
+    sample.fraction = tuned_para[tuned_para$perc_gain==max(tuned_para$perc_gain),"sample.fraction"],
+    respect.unordered.factors = "order",
+    importance      = 'impurity',
+    verbose = FALSE,
+    seed  = 123
+  )
+
+# Show the variable importance plot
+vip::vip(rf_impurity, num_features = 25, bar = FALSE)
+```
+
+### III. Predications
+To deploy the above-resulting model, we need to reformat some feature variables (i.e., location and time features) in the testing data set as we did for the training data set.   
+```{r location test data}
+# Seperate LAT_LONG_RAW into 'LATITUDE' and 'LONGITUDE' columns
+DF_loc <- DF_TEST_raw %>% 
+  select(LAT_LONG_RAW, ZIP) %>%
+  separate(LAT_LONG_RAW,into = c('LATITUDE', 'LONGITUDE'), sep=",")
+
+# Remove "(" and ")"
+DF_loc$LATITUDE <- gsub("[\\(\\)]", "", DF_loc$LATITUDE)
+DF_loc$LONGITUDE <- gsub("[\\(\\)]", "", DF_loc$LONGITUDE)
+
+# Extract 5-digit zipcodes
+DF_loc$ZIP5 <- substr(DF_loc$ZIP, 1, 5)
+DF_loc <- select(DF_loc, -c(ZIP))
+
+# Combine with the original data
+DF_TEST_raw1 <- cbind.data.frame(DF_TEST_raw, DF_loc)
+
+# Adjust coordinate formats
+DF_TEST_raw1$LATITUDE <- as.numeric(DF_TEST_raw1$LATITUDE)
+DF_TEST_raw1$LONGITUDE <- abs(as.numeric(DF_TEST_raw1$LONGITUDE))*(-1)
+
+# Remove observation incorrect coordinates
+DF_TEST_raw1 <- DF_TEST_raw1 %>% filter(LATITUDE != 0)
+  
+# Examine the dimension
+dim(DF_TEST_raw1)
+```
+
+```{r Time object test data}
+# seperate "INSPECTION_TIME" columns into Hour and Date
+Hour <- format(as.POSIXct(strptime(DF_TEST_raw1$INSPECTION_TIME,"%m/%d/%Y %H:%M",tz="")) ,format = "%H:%M")
+Date <- format(as.POSIXct(strptime(DF_TEST_raw1$INSPECTION_TIME,"%m/%d/%Y %H:%M",tz="")) ,format = "%m/%d/%Y")
+
+Hour <- str_sub(Hour, 1, 2)
+Date <- as.Date(Date, format = "%m/%d/%Y")
+Year <- str_sub(Date, 1, 4)
+Month <- str_sub(Date, 6, 7)
+
+# Combine with the original data
+DF_TEST_raw2 <- cbind.data.frame(DF_TEST_raw1, Date, Year, Month, Hour)
+
+# Examine the dimension
+dim(DF_TEST_raw2)
+```
+
+```{r Adjust test data format}
+# Remove na observations
+DF_TEST <- DF_TEST_raw2[complete.cases(DF_TEST_raw2),]
+
+# Examine a change in the number of observation in the resulting dataframe
+sprintf("Remove %d observations from the original data", nrow(DF_TEST) - nrow(DF_TEST_raw2))
+
+sprintf("Remove %.2f percent of the original data", round((nrow(DF_TEST_raw2)-nrow(DF_TEST))/nrow(DF_TEST_raw2)*100,2))
+
+```
+Once we've finished reformating the testing data set, we can use our preferred model to make predictions on a new data set. 
+```{r prediction}
+# Predict
+pred.rf1 <- predict(rf_impurity, data = DF_TEST)
+pred.rf1
+```
+Finally, we store our prediction results. 
+```{r store prediction results, message=FALSE, warning=FALSE}
+# Prediction result
+DF_test_pred <- data.frame(
+  RESTAURANT_SERIAL_NUMBER = DF_TEST$RESTAURANT_SERIAL_NUMBER,
+  CLASSIFIER_PROBABILITY   = pred.rf1$predictions,
+  CLASSIFIER_PREDICTION = (pred.rf1$predictions>0.5) * 1
+)
+```
+
+```{r Save the prediction results, message=FALSE, warning=FALSE, include=FALSE, eval=FALSE}
+# Save the prediction result as a csv file
+write.csv(DF_test_pred, file="predictions_Huang_Yu-Kai_Intern.csv.")
+```
+
+### IV. Recommendations
+This post demonstrates an exploratory analysis and prediction of the next restaurant's inspection grade using the data from [the City of Las Vegas Open Data Portal](https://opendataportal-lasvegas.opendata.arcgis.com/datasets/restaurant-inspections-open-data). The findings indicate that **location information** (e.g., zip code), **employee information** (e.g., median employee age, median employee tenure, employee counts), **inspection information** (e.g., inspection demerits, number of violations), and **inspection time** are key factors to predict the next restaurant's inspection grade. A *minimum viable model* was built based on those determinants, and the corresponding prediction results are generated.
+
+**The recommendations for enhancing the data set to improve the predictive power of the model are:**  
+1. The original **zip code** variable has an inconsistent recording format. Some include only 5-digit zip code, and some do on a more granular scale. As the zip code variable is one of the top features to predict the next restaurant's inspection grade, enhancing the consistency of recording format would improve the model's predictive power.   
+2. In the current data format, **VIOLATIONS_RAW** contains possibly useful information but is hard to be utilized. A possible way to improve this is that creating one table including each violation item code (as a *foreign key*) and violation item name. With this additional table, we can merge the primary data set with the violation item table using the violation item code. In that case, we can explore a relationship between violation items and inspection grades.  
+3. In addition to employees' information, **business owners' characteristics** may be relevant factors influencing the restaurant's operation, and that information is missing in the current data set.  
+4. **Types of consumers** in restaurants are relevant information that can reveal **customer segmentation** for that particular inspection restaurant.  
+5. **The restaurant's operation area and profits** could also reflect the degree of difficulty maintaining operation and financial ability to comply with the inspection requirements.  
+6. **Enforcement of inspection** may differ from time to time. The number of inspectors, their characteristics, and the length of inspection would be useful information.  
+7. The data set contains a relatively high percentage of observations with NAs (22.82%). If the recording data quality can be further improved, that would help for relevant prediction analyses.  
+
+**The analysis of this post has some room for improvement:**  
+1. We use the "complete.cases()" function to filter out about 22.82% of the original samples containing at least one NA observation from one of the columns. This missing data rate is arguably high. More careful rules for filtering NA observations could be explored in the future.  
+2. There is some possible information that is valuable but was not considered in our analysis—for instance, restaurant name, restaurant address, violation item, etc. 
+
+**Reference:**  
+Bradley Boehmke. Random Forests. https://bradleyboehmke.github.io/HOML/random-forest.html  
+Regression Trees. UC Business Analytics R Programming Guide. http://uc-r.github.io/regression_trees  
+Random Forests. UC Business Analytics R Programming Guide. https://uc-r.github.io/random_forests
